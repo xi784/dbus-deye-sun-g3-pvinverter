@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import time
+import socket
 import configparser
 from datetime import datetime
 
@@ -19,7 +20,161 @@ if os.path.isdir(VICTRON_PATH):
     sys.path.insert(1, VICTRON_PATH)
 
 from vedbus import VeDbusService
-from DeyeAtComm import DeyeAtComm
+
+
+class DeyeAtComm:
+    Logger_Init_CMD = b"WIFIKIT-214028-READ"
+
+    def __init__(self, ip, port, timeout=1):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.settimeout(timeout)
+        self.Logger_IP = ip
+        self.Logger_Port = port
+        self.ip = ""
+        self.mac = ""
+        self.serial = ""
+
+        try:
+            self.ip, self.mac, self.serial = self.hello()
+        except Exception:
+            logging.exception("Deye logger hello failed")
+            raise
+
+    def __del__(self):
+        try:
+            self.bye()
+        except Exception:
+            pass
+
+    @staticmethod
+    def modbus_crc(data):
+        poly = 0xA001
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x0001:
+                    crc = (crc >> 1) ^ poly
+                else:
+                    crc = crc >> 1
+        return crc & 0xFFFF
+
+    def build_request(self, register_addr, count, function, values=None):
+        payload = bytearray([1, function])
+        payload.extend(register_addr.to_bytes(2, "big"))
+        payload.extend(count.to_bytes(2, "big"))
+
+        if values is not None:
+            payload.extend(len(values).to_bytes(2, "big"))
+            for value in values:
+                payload.extend(int(value).to_bytes(2, "big"))
+
+        crc = self.modbus_crc(payload)
+        payload.extend(crc.to_bytes(2, "little"))
+
+        req_len = len(payload)
+        cmd = "INVDATA={0},{1}".format(req_len, payload.hex())
+        return ("AT+" + cmd + "\n").encode("ascii")
+
+    def parse_at_response(self, rx_data):
+        if not rx_data:
+            raise ValueError("Empty response from Deye logger")
+
+        text = rx_data.decode("ascii", errors="replace")
+        text = text.replace("\x10", "").replace("\r", "").strip()
+
+        if "+ok=" in text:
+            payload_hex = text.split("+ok=", 1)[1]
+        else:
+            payload_hex = text
+
+        if not payload_hex:
+            raise ValueError("No payload in Deye logger response")
+
+        payload = bytes.fromhex(payload_hex)
+
+        if len(payload) < 5:
+            raise ValueError("Response payload too short: {0!r}".format(payload))
+
+        crc_rx = payload[-2:]
+        crc_calc = self.modbus_crc(payload[:-2]).to_bytes(2, "little")
+        if crc_rx != crc_calc:
+            raise ValueError(
+                "CRC mismatch: got {0}, expected {1}".format(
+                    crc_rx.hex(), crc_calc.hex()
+                )
+            )
+
+        rx_len = payload[2]
+
+        if rx_len == 0:
+            return []
+
+        expected_len = rx_len + 5
+        if len(payload) != expected_len:
+            raise ValueError(
+                "Unexpected payload length: got {0}, expected {1}. payload={2!r}".format(
+                    len(payload), expected_len, payload
+                )
+            )
+
+        values = []
+        for idx in range(rx_len // 2):
+            start = 3 + idx * 2
+            word = payload[start:start + 2]
+            values.append(int.from_bytes(word, "big"))
+
+        return values
+
+    def hello(self):
+        self.sock.sendto(self.Logger_Init_CMD, (self.Logger_IP, self.Logger_Port))
+        data = self.sock.recv(1024)
+
+        text = data.decode("ascii", errors="replace")
+        text = text.replace("\x10", "").replace("\r", "").strip()
+
+        logging.debug("Hello response: %r", text)
+
+        if "+ok=" in text:
+            text = text.split("+ok=", 1)[1]
+
+        if not text:
+            raise ValueError("Logger hello response empty")
+
+        parts = [p.strip() for p in text.split(",")]
+        if len(parts) < 3:
+            raise ValueError("Unexpected hello response format: {0!r}".format(text))
+
+        self.sock.sendto(b"+ok", (self.Logger_IP, self.Logger_Port))
+        return parts[0], parts[1], parts[2]
+
+    def bye(self):
+        self.sock.sendto(b"AT+Q\n", (self.Logger_IP, self.Logger_Port))
+
+    def getversion(self):
+        self.sock.sendto(b"AT+YZVER\n", (self.Logger_IP, self.Logger_Port))
+        repl = self.sock.recv(1024)
+        text = repl.decode("ascii", errors="replace").replace("\x10", "").replace("\r", "").strip()
+        if "+ok=" not in text:
+            raise ValueError("getversion reply is not OK: {0!r}".format(text))
+        version = text.split("+ok=", 1)[1].strip()
+        return version
+
+    def read(self, register_addr, count):
+        request = self.build_request(register_addr, count, 0x03)
+        logging.debug("Read request: %r", request)
+        self.sock.sendto(request, (self.Logger_IP, self.Logger_Port))
+        rx = self.sock.recv(1024)
+        logging.debug("Read response: %r", rx)
+        return self.parse_at_response(rx)
+
+    def write(self, register_addr, count, values):
+        request = self.build_request(register_addr, count, 0x10, values)
+        logging.debug("Write request: %r", request)
+        self.sock.sendto(request, (self.Logger_IP, self.Logger_Port))
+        rx = self.sock.recv(1024)
+        logging.debug("Write response: %r", rx)
+        return self.parse_at_response(rx)
 
 
 class DbusDeyeClusterService:
@@ -37,9 +192,8 @@ class DbusDeyeClusterService:
         self._paths = paths
         self._lastUpdate = 0
 
-        logging.debug("%s /DeviceInstance = %d" % (servicename, deviceinstance))
+        logging.debug("%s /DeviceInstance = %d", servicename, deviceinstance)
 
-        # Create management objects
         self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
         self._dbusservice.add_path(
             '/Mgmt/ProcessVersion',
@@ -47,7 +201,6 @@ class DbusDeyeClusterService:
         )
         self._dbusservice.add_path('/Mgmt/Connection', connection)
 
-        # Mandatory objects
         self._dbusservice.add_path('/DeviceInstance', deviceinstance)
         self._dbusservice.add_path('/ProductId', 0xFFFF)
         self._dbusservice.add_path('/ProductName', productname)
@@ -62,7 +215,6 @@ class DbusDeyeClusterService:
         self._dbusservice.add_path('/Position', int(config['DEFAULT']['Position']))
         self._dbusservice.add_path('/StatusCode', 0)
 
-        # Add path values to dbus
         for path, settings in self._paths.items():
             self._dbusservice.add_path(
                 path,
@@ -72,7 +224,6 @@ class DbusDeyeClusterService:
                 onchangecallback=self._handlechangedvalue
             )
 
-        # Timers
         update_interval = int(config['DEFAULT']['UpdateInterval'])
         gobject.timeout_add(update_interval * 1000, self._update)
         gobject.timeout_add(self._getSignOfLifeInterval() * 60 * 1000, self._signOfLife)
@@ -96,7 +247,6 @@ class DbusDeyeClusterService:
         return int(value) if value else 5
 
     def _poll_inverter(self, address, port, reset_daily):
-        """Poll a single inverter with robust exception handling."""
         if not address:
             return None
 
@@ -123,8 +273,8 @@ class DbusDeyeClusterService:
                 "online": True,
             }
 
-        except Exception as e:
-            logging.debug("Inverter at %s not reachable or offline: %s", address, e)
+        except Exception as exc:
+            logging.debug("Inverter at %s not reachable or offline: %s", address, exc)
             return {
                 "energy": 0.0,
                 "power": 0.0,
@@ -263,8 +413,8 @@ class DbusDeyeClusterService:
             self._dbusservice['/Connected'] = 1 if any_online else 0
             self._lastUpdate = time.time()
 
-        except Exception as e:
-            logging.critical('Error in cluster _update: %s', e, exc_info=True)
+        except Exception as exc:
+            logging.critical("Error in cluster _update: %s", exc, exc_info=True)
 
         try:
             index = int(self._dbusservice['/UpdateIndex']) + 1
@@ -305,10 +455,13 @@ def main():
 
         def _kwh(p, v):
             return str(round(v, 2)) + 'kWh'
+
         def _a(p, v):
             return str(round(v, 1)) + 'A'
+
         def _w(p, v):
             return str(round(v, 1)) + 'W'
+
         def _v(p, v):
             return str(round(v, 1)) + 'V'
 
@@ -339,8 +492,8 @@ def main():
         mainloop = gobject.MainLoop()
         mainloop.run()
 
-    except Exception as e:
-        logging.critical('Error in main: %s', e, exc_info=True)
+    except Exception as exc:
+        logging.critical('Error in main: %s', exc, exc_info=True)
 
 
 if __name__ == "__main__":
