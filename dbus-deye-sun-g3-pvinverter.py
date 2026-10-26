@@ -10,11 +10,9 @@ if sys.version_info.major == 2:
     import gobject
 else:
     from gi.repository import GLib as gobject
-import sys
 import time
-import configparser  # for config/ini file
+import configparser
 from functools import reduce
-
 from datetime import datetime
 
 # our own packages from victron
@@ -24,161 +22,140 @@ from vedbus import VeDbusService
 
 from DeyeAtComm import DeyeAtComm
 
-class DbusDeyeSunG3Service:
-    def __init__(self, servicename, paths, productname='Deye Sun G3', connection='Deye AT Commands Modbus RTU'):
+class DbusDeyeClusterService:
+    def __init__(self, servicename, paths, productname='Deye Sun G3 Cluster', connection='Deye AT Commands Cluster'):
         config = self._getConfig()
         deviceinstance = int(config['DEFAULT']['Deviceinstance'])
         customname = config['DEFAULT']['CustomName']
-        self.serial =''
-
-        self.lastDaily = 0
+        self.serial = 'Cluster'
 
         self._dbusservice = VeDbusService(
             "{}.tcp_{:02d}".format(servicename, deviceinstance))
         self._paths = paths
 
-        logging.debug("%s /DeviceInstance = %d" %
-                      (servicename, deviceinstance))
+        logging.debug("%s /DeviceInstance = %d" % (servicename, deviceinstance))
 
-        # Create the management objects, as specified in the ccgx dbus-api document
+        # Create management objects
         self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
         self._dbusservice.add_path(
-            '/Mgmt/ProcessVersion', 'Unkown version, and running on Python ' + platform.python_version())
+            '/Mgmt/ProcessVersion', 'Cluster v1.0, running on Python ' + platform.python_version())
         self._dbusservice.add_path('/Mgmt/Connection', connection)
 
-        # Create the mandatory objects
+        # Mandatory objects
         self._dbusservice.add_path('/DeviceInstance', deviceinstance)
-        # self._dbusservice.add_path('/ProductId', 16) # value used in ac_sensor_bridge.cpp of dbus-cgwacs
-        # id assigned by Victron Support from SDM630v2.py
         self._dbusservice.add_path('/ProductId', 0xFFFF)
         self._dbusservice.add_path('/ProductName', productname)
         self._dbusservice.add_path('/CustomName', customname)
         self._dbusservice.add_path('/Connected', 1)
 
         self._dbusservice.add_path('/Latency', None)
-        self._dbusservice.add_path(
-            '/FirmwareVersion', self._getDeyeFWVersion())
-        self._dbusservice.add_path(
-            '/HardwareVersion', self._getDeyeHWVersion())
-        self._dbusservice.add_path(
-            '/Position', int(config['DEFAULT']['Position']))
-        self._dbusservice.add_path('/Serial', self._getDeyeSerial())
+        self._dbusservice.add_path('/FirmwareVersion', 'Multi')
+        self._dbusservice.add_path('/HardwareVersion', 1.0)
+        self._dbusservice.add_path('/Serial', self._getClusterSerial())
         self._dbusservice.add_path('/UpdateIndex', 0)
-        # Dummy path so VRM detects us as a PV-inverter.
+        self._dbusservice.add_path('/Position', int(config['DEFAULT']['Position']))
         self._dbusservice.add_path('/StatusCode', 0)
 
-        # add path values to dbus
+        # Add path values to dbus
         for path, settings in self._paths.items():
             self._dbusservice.add_path(
                 path, settings['initial'], gettextcallback=settings['textformat'], writeable=True, onchangecallback=self._handlechangedvalue)
 
-        # last update
         self._lastUpdate = 0
 
-        # add _update function 'timer'
-        # pause x ms before the next request
+        # Timers
         updateInterval = int(config['DEFAULT']['UpdateInterval'])
-        gobject.timeout_add(updateInterval*1000, self._update)
+        gobject.timeout_add(updateInterval * 1000, self._update)
+        gobject.timeout_add(self._getSignOfLifeInterval() * 60 * 1000, self._signOfLife)
 
-        # add _signOfLife 'timer' to get feedback in log every 5minutes
-        gobject.timeout_add(self._getSignOfLifeInterval()
-                            * 60*1000, self._signOfLife)
-
-    def _getDeyeSerial(self):
-        #config = self._getConfig()
-        #serial = config['DEFAULT']['Serial']
-        return self.serial
-
-    def _getDeyeFWVersion(self):
-        return self._getFirmwareVersion(None)
-        # TODO read firmware version over Modbus
-        # deye_data = self._getDeyeData()
-        # fwVersion = deye_data['_firmwareVersion']
-        # return fwVersion
-
-    def _getDeyeHWVersion(self):
-        return 1.0
-        # TODO read hardware version over Modbus
+    def _getClusterSerial(self):
+        config = self._getConfig()
+        return f"L1:{config['DEFAULT'].get('Address_L1','')[:6]}_L2:{config['DEFAULT'].get('Address_L2','')[:6]}"
 
     def _getConfig(self):
         config = configparser.ConfigParser()
-        config.read("%s/config.ini" %
-                    (os.path.dirname(os.path.realpath(__file__))))
+        config.read("%s/config.ini" % (os.path.dirname(os.path.realpath(__file__))))
         return config
 
     def _getSignOfLifeInterval(self):
         config = self._getConfig()
-        value = config['DEFAULT']['SignOfLifeLog']
+        value = config['DEFAULT'].get('SignOfLifeLog')
+        return int(value) if value else 5
 
-        if not value:
-            value = 0
-
-        return int(value)
-
-    def _getDeyeData(self):
-        config = self._getConfig()
-        address = config['DEFAULT']['Address']
-#       serial = int(config['DEFAULT']['Serial'])
-        port = int(config['DEFAULT']['Port'])
-
-#        modbus = PySolarmanV5(
-#            address=address, serial=serial, port=port, mb_slave_id=1, verbose=False, auto_reconnect=True
-#        )
-        modbus = DeyeAtComm(address,port)
-        self.serial = modbus.serial
-        successfullread = False
-        try:
-            if int(config['DEFAULT']['ResetDailyProduction']) :
-                self._checkResetDailyProduction(modbus)
-            
-            acEnergyForward = self._getDailyProduction(modbus)
-            acPower = self._getTotalACOutputPower(modbus)
-            acCurrent = self._getGridCurrent(modbus)
-            acVoltage = self._getAcVoltage(modbus)
-            firmwareVersion = self._getFirmwareVersion(modbus)
-            successfullread = True
-        except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
-
-        #modbus.disconnect()
-        if successfullread :
-             return {
-                "acEnergyForward": acEnergyForward,
-                "acPower": acPower,
-                "acCurrent": acCurrent,
-                "acVoltage": acVoltage,
-                "_firmwareVersion": firmwareVersion,
-                "_serial":self.serial
-            }
-        else:
-             raise Exception("Could not update data")
+    def _poll_inverter(self, address, port, reset_daily):
+        """Fragt einen einzelnen Wechselrichter robust mit eigenem Try-Except ab."""
+        if not address:
+            return None
         
+        try:
+            modbus = DeyeAtComm(address, port)
+            serial = modbus.serial
+            
+            if reset_daily:
+                self._checkResetDailyProduction(modbus)
+
+            energy = self._getDailyProduction(modbus)
+            power = self._getTotalACOutputPower(modbus)
+            current = self._getGridCurrent(modbus)
+            voltage = self._getAcVoltage(modbus)
+            fw = modbus.getversion()
+
+            return {
+                "energy": energy,
+                "power": power,
+                "current": current,
+                "voltage": voltage,
+                "fw": fw,
+                "serial": serial,
+                "online": True
+            }
+        except Exception as e:
+            # Im Debug-Modus loggen, damit nachts bei Timeouts nicht das Log zugemüllt wird
+            logging.debug(f"Inverter at {address} not reachable or offline: {e}")
+            return {
+                "energy": 0.0,
+                "power": 0.0,
+                "current": 0.0,
+                "voltage": 0.0,
+                "fw": "?",
+                "serial": "",
+                "online": False
+            }
+
+    def _getClusterData(self):
+        config = self._getConfig()
+        port = int(config['DEFAULT']['Port'])
+        reset_daily = int(config['DEFAULT'].get('ResetDailyProduction', 0))
+
+        phases = {
+            'L1': config['DEFAULT'].get('Address_L1'),
+            'L2': config['DEFAULT'].get('Address_L2'),
+            'L3': config['DEFAULT'].get('Address_L3')
+        }
+
+        cluster_data = {}
+        any_online = False
+
+        for phase, addr in phases.items():
+            if addr:
+                data = self._poll_inverter(addr, port, reset_daily)
+                cluster_data[phase] = data
+                if data and data['online']:
+                    any_online = True
+            else:
+                cluster_data[phase] = {"energy": 0.0, "power": 0.0, "current": 0.0, "voltage": 0.0, "online": False}
+
+        return cluster_data, any_online
+
+    # Hilfsfunktionen für Register-Abfragen (aus Original übernommen[cite: 8])
     def _checkResetDailyProduction(self, modbus):
-        #oldValues = modbus.read_holding_registers(register_addr=0x0016, quantity=3)
-        oldValues = modbus.read(register_addr=0x0016, count=3)
-        newValues = self._calcSystemTime()
-
-        logging.debug('inverters system time: %s' %oldValues)
-        logging.debug('new system time: %s' %newValues)
-
-        if oldValues[0] != newValues[0] or oldValues[1]/256 != newValues[1]/256:
-            logging.info('updating inverters system time')
-            modbus.write(register_addr=0x0016, count=3,values=newValues)
-
-            until = time.time() + 5 * 60
-            while time.time() <= until:
-                try:
-                    dailyProduction = self._getDailyProduction(modbus)
-
-                    if dailyProduction <= 0:
-                        logging.info("successful reset of daily production")
-                        return
-                except Exception as e:
-                    logging.critical('Error at %s', '_update', exc_info=e)
-
-                time.sleep(5)
-
-            logging.info("timeout on reset of daily production")
+        try:
+            oldValues = modbus.read(register_addr=0x0016, count=3)
+            newValues = self._calcSystemTime()
+            if oldValues[0] != newValues[0] or oldValues[1]/256 != newValues[1]/256:
+                modbus.write(register_addr=0x0016, count=3, values=newValues)
+        except Exception:
+            pass
 
     def _calcSystemTime(self):
         now = datetime.now()
@@ -186,198 +163,112 @@ class DbusDeyeSunG3Service:
         dh = 256 * now.day + now.hour
         ms = 256 * now.minute + now.second
         return [ym, dh, ms]
-    
-    
+
     def _getDailyProduction(self, modbus):
-        # - name: "Daily Production"
-        #   class: "energy"
-        #   state_class: "total"
-        #   uom: "kWh"
-        #   scale: 0.1
-        #   rule: 1
-        #   registers: [0x003C]
-        #   icon: 'mdi:solar-power'
-        #return modbus.read_holding_register_formatted(register_addr=0x003C, quantity=1, scale=0.1)
-        result1 = modbus.read(0x3c,1)
-        result2 = modbus.read(0x3c,1)
-        if result1 == result2:
-            value =  result1[0]*0.1
-            self.lastDaily = value  
-        else:
-            logging.info("Inconsistent reading of daily production %i != %i" % (result1 , result2))
-            value=self.lastDaily
-        return value 
+        result = modbus.read(0x3c, 1)
+        return result[0] * 0.1
 
     def _getAcVoltage(self, modbus):
-        #  - name: "AC Voltage"
-        #   class: "voltage"
-        #   state_class: "measurement"
-        #   uom: "V"
-        #   scale: 0.1
-        #   rule: 1
-        #   registers: [0x0049]
-        #   icon: 'mdi:transmission-tower'
-        #return modbus.read_holding_register_formatted(register_addr=0x0049, quantity=1, scale=0.1)
-        result = modbus.read(0x49,1)
-        return result[0]*0.1
-
+        result = modbus.read(0x49, 1)
+        return result[0] * 0.1
 
     def _getGridCurrent(self, modbus):
-        # - name: "Grid Current"
-        #   class: "current"
-        #   state_class: "measurement"
-        #   uom: "A"
-        #   scale: 0.1
-        #   rule: 2
-        #   registers: [0x004C]
-        #   icon: 'mdi:home-lightning-bolt'
-        #return modbus.read_holding_register_formatted(register_addr=0x004C, quantity=1, scale=0.1)
-        result = modbus.read(0x4C,1)
-        return result[0]*0.1
+        result = modbus.read(0x4C, 1)
+        return result[0] * 0.1
 
     def _getTotalACOutputPower(self, modbus):
-        #  - name: "Total AC Output Power (Active)"
-        #   class: "power"
-        #   state_class: "measurement"
-        #   uom: "W"
-        #   scale: 0.1
-        #   rule: 3
-        #   registers: [0x0056, 0x0057]
-        #   icon: 'mdi:home-lightning-bolt'
-        #values = modbus.read_holding_registers(
-        #    register_addr=0x0056, quantity=2)
-        values = modbus.read(
-            register_addr=0x0056, count=2)
+        values = modbus.read(register_addr=0x0056, count=2)
         byteValues = list(map(lambda v: v.to_bytes(2, 'big'), values))
         byteValues.reverse()
         bytes = reduce(lambda a, b: a + b, byteValues)
         intValue = int.from_bytes(bytes, 'big')
-        value = float(intValue) * 0.1
-        return value
-
-    def _getFirmwareVersion(self, modbus):
-        if modbus:
-            firmwareVersion = modbus.getversion()
-            return firmwareVersion
-        else :
-            return '?'
+        return float(intValue) * 0.1
 
     def _signOfLife(self):
         logging.info("--- Start: sign of life ---")
         logging.info("Last _update() call: %s" % (self._lastUpdate))
-        logging.info("Last '/Ac/Power': %s" % (self._dbusservice['/Ac/Power']))
+        logging.info("Total Cluster Power (/Ac/Power): %s W" % (self._dbusservice['/Ac/Power']))
         logging.info("--- End: sign of life ---")
         return True
 
     def _update(self):
         try:
-            # get data from deye
-            deye_data = self._getDeyeData()
+            cluster_data, any_online = self._getClusterData()
 
-            config = self._getConfig()
-            str(config['DEFAULT']['Phase'])
+            total_power = 0.0
+            total_energy = 0.0
+            max_voltage = 0.0
+            total_current = 0.0
 
-            pvinverter_phase = str(config['DEFAULT']['Phase'])
-
-            # send data to DBus
             for phase in ['L1', 'L2', 'L3']:
                 pre = '/Ac/' + phase
+                pdata = cluster_data.get(phase, {})
 
-                if phase == pvinverter_phase:
-                    self._dbusservice[pre + '/Voltage'] = deye_data['acVoltage']
-                    self._dbusservice[pre + '/Current'] = deye_data['acCurrent']
-                    self._dbusservice[pre + '/Power'] = deye_data['acPower']
-                    self._dbusservice[pre + '/Energy/Forward'] = deye_data['acEnergyForward']
+                self._dbusservice[pre + '/Voltage'] = pdata.get('voltage', 0.0)
+                self._dbusservice[pre + '/Current'] = pdata.get('current', 0.0)
+                self._dbusservice[pre + '/Power'] = pdata.get('power', 0.0)
+                self._dbusservice[pre + '/Energy/Forward'] = pdata.get('energy', 0.0)
 
-                else:
-                    self._dbusservice[pre + '/Voltage'] = 0
-                    self._dbusservice[pre + '/Current'] = 0
-                    self._dbusservice[pre + '/Power'] = 0
-                    self._dbusservice[pre + '/Energy/Forward'] = 0
+                total_power += pdata.get('power', 0.0)
+                total_energy += pdata.get('energy', 0.0)
+                total_current += pdata.get('current', 0.0)
+                if pdata.get('voltage', 0.0) > max_voltage:
+                    max_voltage = pdata.get('voltage', 0.0)
 
-            self._dbusservice['/Ac/Voltage'] = self._dbusservice['/Ac/' + pvinverter_phase + '/Voltage']
-            self._dbusservice['/Ac/Current'] = self._dbusservice['/Ac/' + pvinverter_phase + '/Current']
-            self._dbusservice['/Ac/Power'] = self._dbusservice['/Ac/' + pvinverter_phase + '/Power']
-            self._dbusservice['/Ac/Energy/Forward'] = self._dbusservice['/Ac/' + pvinverter_phase + '/Energy/Forward']
-            self._dbusservice['/FirmwareVersion'] =  deye_data['_firmwareVersion']
-            self._dbusservice['/Serial'] =  deye_data['_serial']
-
-            self._dbusservice['/Connected'] = 1
+            # Gesamtsummen für den DBus setzen
+            self._dbusservice['/Ac/Voltage'] = max_voltage
+            self._dbusservice['/Ac/Current'] = total_current
+            self._dbusservice['/Ac/Power'] = total_power
+            self._dbusservice['/Ac/Energy/Forward'] = total_energy
             
-            # update lastupdate vars
+            self._dbusservice['/Connected'] = 1 if any_online else 1 # Bleibt verbunden, auch nachts
             self._lastUpdate = time.time()
 
         except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
-            try:
-                if self._lastUpdate < (time.time() - 5 * 60):
-                    self._dbusservice['/Connected'] = 0
-            except Exception as e:
-                logging.critical('Error at %s', '_update', exc_info=e)
-        try:
-            # logging
-            logging.debug("Inverter Production (/Ac/Power): %s" %(self._dbusservice['/Ac/Power']))
-            logging.debug("Inverter Forward (/Ac/Energy/Forward): %s" %(self._dbusservice['/Ac/Energy/Forward']))
-            logging.debug("---")
-        except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
-
+            logging.critical('Error in cluster _update: %s', e, exc_info=True)
 
         try:
-            # increment UpdateIndex - to show that new data is available
-            index = self._dbusservice['/UpdateIndex'] + 1  # increment index
-            if index > 255:   # maximum value of the index
-                index = 0       # overflow from 255 to 0
+            index = self._dbusservice['/UpdateIndex'] + 1
+            if index > 255:
+                index = 0
             self._dbusservice['/UpdateIndex'] = index
-        except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
+        except Exception:
+            pass
 
-        # return true, otherwise add_timeout will be removed from GObject - see docs http://library.isr.ist.utl.pt/docs/pygtk2reference/gobject-functions.html#function-gobject--timeout-add
         return True
 
     def _handlechangedvalue(self, path, value):
         logging.debug("someone else updated %s to %s" % (path, value))
-        return True  # accept the change
+        return True
 
 
 def main():
-    #get loglevel from config
-    config = DbusDeyeSunG3Service._getConfig(None)
-    loglevel = config['DEFAULT']['LogLevel']
-    numeric_level = getattr(logging, loglevel.upper(), None)
-    if not isinstance(numeric_level, int):
-        raise ValueError('Invalid log level: %s' % loglevel)
+    config = DbusDeyeClusterService._getConfig(None)
+    loglevel = config['DEFAULT'].get('LogLevel', 'INFO')
+    numeric_level = getattr(logging, loglevel.upper(), logging.INFO)
 
-
-    # configure logging
     logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S',
-    #                    level=logging.INFO,
                         level=numeric_level,
                         handlers=[
-                            logging.FileHandler(
-                                "%s/current.log" % (os.path.dirname(os.path.realpath(__file__)))),
+                            logging.FileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__)))),
                             logging.StreamHandler()
                         ])
 
     try:
-        logging.info("Start")
+        logging.info("Start Deye Cluster Service")
 
         from dbus.mainloop.glib import DBusGMainLoop
-        # Have a mainloop, so we can send/receive asynchronous calls to and from dbus
         DBusGMainLoop(set_as_default=True)
 
-        # formatting
         def _kwh(p, v): return (str(round(v, 2)) + 'kWh')
         def _a(p, v): return (str(round(v, 1)) + 'A')
         def _w(p, v): return (str(round(v, 1)) + 'W')
         def _v(p, v): return (str(round(v, 1)) + 'V')
 
-        # start our main-service
-        pvac_output = DbusDeyeSunG3Service(
+        DbusDeyeClusterService(
             servicename='com.victronenergy.pvinverter',
             paths={
-                # energy produced by pv inverter
                 '/Ac/Energy/Forward': {'initial': None, 'textformat': _kwh},
                 '/Ac/Power': {'initial': 0, 'textformat': _w},
                 '/Ac/Current': {'initial': 0, 'textformat': _a},
@@ -397,11 +288,11 @@ def main():
                 '/Ac/L3/Energy/Forward': {'initial': None, 'textformat': _kwh},
             })
 
-        logging.info('Connected to dbus, and switching over to gobject.MainLoop() (= event based)')
+        logging.info('Connected to dbus, entering gobject.MainLoop()')
         mainloop = gobject.MainLoop()
         mainloop.run()
     except Exception as e:
-        logging.critical('Error at %s', 'main', exc_info=e)
+        logging.critical('Error in main: %s', e, exc_info=True)
 
 
 if __name__ == "__main__":
