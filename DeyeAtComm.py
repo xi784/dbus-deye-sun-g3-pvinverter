@@ -1,152 +1,133 @@
+""" A basic class fro Communication with Deye Inverters via AT commands """
+
 import socket
 import logging
 
 class DeyeAtComm:
-    Logger_Init_CMD = b"WIFIKIT-214028-READ"
+    Logger_Init_CMD=b'WIFIKIT-214028-READ'
 
-    def __init__(self, ip, port, timeout=1):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.sock.settimeout(timeout)
-        self.Logger_IP = ip
-        self.Logger_Port = port
-        self.ip = ""
-        self.mac = ""
-        self.serial = ""
-
-        try:
-            self.ip, self.mac, self.serial = self.hello()
-        except Exception:
-            logging.exception("Deye logger hello failed")
-            raise
-
-    def __del__(self):
-        try:
-            self.bye()
-        except Exception:
-            pass
-
-    @staticmethod
-    def modbus_crc(data):
-        poly = 0xA001
+    def modbus_crc(self,data):
+        POLY = 0xA001
         crc = 0xFFFF
         for byte in data:
             crc ^= byte
             for _ in range(8):
                 if crc & 0x0001:
-                    crc = (crc >> 1) ^ poly
+                    crc = (crc >> 1) ^ POLY
                 else:
                     crc = crc >> 1
-        return crc & 0xFFFF
+        return crc
 
-    def build_request(self, register_addr, count, function, values=None):
-        payload = bytearray([1, function])
-        payload.extend(register_addr.to_bytes(2, "big"))
-        payload.extend(count.to_bytes(2, "big"))
 
-        if values is not None:
-            payload.extend(len(values).to_bytes(2, "big"))
-            for value in values:
-                payload.extend(int(value).to_bytes(2, "big"))
 
-        crc = self.modbus_crc(payload)
-        payload.extend(crc.to_bytes(2, "little"))
+    def deye_at_command(self,register_addr : int ,count : int, function :int,values = None) :
+        req_data = bytearray([1, function])
+        req_data.extend(register_addr.to_bytes(2,'big'))
+        req_data.extend(count.to_bytes(2,'big'))
+        if values:
+            v_len=len(values)
+            req_data.extend(v_len.to_bytes(2,'big'))
+            for v in values:
+                req_data.extend(v.to_bytes(2,'big'))
+        crc = self.modbus_crc(req_data)
+        req_data.extend(crc.to_bytes(2,'little'))
+        req_len=len(req_data)
+        cmd = f'INVDATA={req_len},{req_data.hex()}'
+        at_cmd = f'AT+{cmd}\n'.encode()
+        return at_cmd
 
-        req_len = len(payload)
-        cmd = "INVDATA={0},{1}".format(req_len, payload.hex())
-        return ("AT+" + cmd + "\n").encode("ascii")
+    def parse_at_response(self,rx_data : bytes) :
+        rx_string= rx_data.decode('ASCII')
+        rx_string = rx_string.replace('\x10','')
+        rx_string = rx_string.replace('\r','')
+        rx_string = rx_string.strip()
+        assert '+ok=' in rx_string, f'RX String does is not "OK": {rx_string=}'
+        rx_payload=rx_string.partition('+ok=')[2]
+        payload_bin = bytes.fromhex(rx_payload)
+        crc_check = self.modbus_crc(payload_bin[:-2])
+        crc_check = crc_check.to_bytes(2,'little')
+        crc_rx = payload_bin[-2:]
+        assert crc_rx == crc_rx, f'CRC error rx:{crc_rx=} not {crc_check}'
+        rx_len = payload_bin[2]
+        assert rx_len==0 or rx_len+5 == len(payload_bin), f'Payload length is not {rx_len=}: {payload_bin=}'
+    #    return  ModbusResponse(
+    #                            slave_id=payload_bin[0],
+    #                            modbus_function=payload_bin[1],
+    #                            payload=payload_bin[3:-2]
+    #                            )
+        payload=[]
+    #    print(f'Convert {payload_bin=}:')
+        for idx in range(int(rx_len/2)):
+            (h,l) = payload_bin[2*idx+3:2*idx+5]
+            v=int.from_bytes((h,l),'big')
+    #        print(f'{h=},{l=} to: {v=}')
+            payload.append(v)
+    #    return payload_bin[3:-2]
+        return payload
 
-    def parse_at_response(self, rx_data):
-        if not rx_data:
-            raise ValueError("Empty response from Deye logger")
 
-        text = rx_data.decode("ascii", errors="replace")
-        text = text.replace("\x10", "").replace("\r", "").strip()
 
-        if "+ok=" in text:
-            payload_hex = text.split("+ok=", 1)[1]
-        else:
-            payload_hex = text
 
-        if not payload_hex:
-            raise ValueError("No payload in Deye logger response")
 
-        payload = bytes.fromhex(payload_hex)
+    def read(self, register_addr :int ,count :int) :
+        payload=self.deye_at_command(register_addr,count,0x03)
+    #    print(f'Read Send Payload: "{payload}"')
+        logging.debug(f'Read Send Payload: "{payload}"')
+        self.sock.sendto(payload,(self.Logger_IP,self.Logger_Port))
+        rx_payload=self.sock.recv(1024)
+        logging.debug(f'Read Recv Payload: "{rx_payload}"')
+        response=self.parse_at_response(rx_payload)
+        return response
 
-        if len(payload) < 5:
-            raise ValueError(f"Response payload too short: {payload!r}")
+    def write(self, register_addr:int, count : int, values ) :
+        payload=self.deye_at_command(register_addr,count,0x10,values)
+    #    print(f'Write Send Payload: "{payload}"')
+        logging.debug(f'Write Send Payload: "{payload}"')
+        self.sock.sendto(payload,(self.Logger_IP,self.Logger_Port))
+        rx_payload=self.sock.recv(1024)
+        logging.debug(f'Write Recv  Payload: "{rx_payload}"')
+        response=self.parse_at_response(rx_payload)
+        return response
 
-        crc_rx = payload[-2:]
-        crc_calc = self.modbus_crc(payload[:-2]).to_bytes(2, "little")
-        if crc_rx != crc_calc:
-            raise ValueError(
-                f"CRC mismatch: got {crc_rx.hex()}, expected {crc_calc.hex()}"
-            )
 
-        rx_len = payload[2]
 
-        if rx_len == 0:
-            return []
+    def hello(self) :
+        logging.debug(f'Hello Send Payload: "{self.Logger_Init_CMD,}"')
+        self.sock.sendto(self.Logger_Init_CMD,(self.Logger_IP,self.Logger_Port))
+        data=self.sock.recv(1024)
+        logging.debug(f'Helo Recv  Payload: "{data}"')
+        self.sock.sendto(b'+ok',(self.Logger_IP,self.Logger_Port))
+        logging.debug(f'Hello Send +ok"')
+        return data.decode().split(',')
 
-        expected_len = rx_len + 5
-        if len(payload) != expected_len:
-            raise ValueError(
-                f"Unexpected payload length: got {len(payload)}, expected {expected_len}. payload={payload!r}"
-            )
+    def bye(self) :
+        self.sock.sendto(b'AT+Q\n',(self.Logger_IP,self.Logger_Port))
 
-        values = []
-        for idx in range(rx_len // 2):
-            start = 3 + idx * 2
-            word = payload[start:start + 2]
-            values.append(int.from_bytes(word, "big"))
-
-        return values
-
-    def hello(self):
-        self.sock.sendto(self.Logger_Init_CMD, (self.Logger_IP, self.Logger_Port))
-        data = self.sock.recv(1024)
-
-        text = data.decode("ascii", errors="replace")
-        text = text.replace("\x10", "").replace("\r", "").strip()
-
-        logging.debug("Hello response: %r", text)
-
-        if "+ok=" in text:
-            text = text.split("+ok=", 1)[1]
-
-        if not text:
-            raise ValueError("Logger hello response empty")
-
-        parts = [p.strip() for p in text.split(",")]
-        if len(parts) < 3:
-            raise ValueError(f"Unexpected hello response format: {text!r}")
-
-        self.sock.sendto(b"+ok", (self.Logger_IP, self.Logger_Port))
-        return parts[0], parts[1], parts[2]
-
-    def bye(self):
-        self.sock.sendto(b"AT+Q\n", (self.Logger_IP, self.Logger_Port))
-
-    def getversion(self):
-        self.sock.sendto(b"AT+YZVER\n", (self.Logger_IP, self.Logger_Port))
-        repl = self.sock.recv(1024)
-        text = repl.decode("ascii", errors="replace").replace("\x10", "").replace("\r", "").strip()
-        if "+ok=" not in text:
-            raise ValueError(f"getversion reply is not OK: {text!r}")
-        version = text.split("+ok=", 1)[1].strip()
+    def getversion(self) :
+        self.sock.sendto(b'AT+YZVER\n',(self.Logger_IP,self.Logger_Port))
+        repl = self.sock.recv(1024).decode()
+        assert'+ok=' in repl, f'getversion, Reply is not ok: {repl}'
+        (status,version)=repl.split('=')
         return version
 
-    def read(self, register_addr, count):
-        request = self.build_request(register_addr, count, 0x03)
-        logging.debug("Read request: %r", request)
-        self.sock.sendto(request, (self.Logger_IP, self.Logger_Port))
-        rx = self.sock.recv(1024)
-        logging.debug("Read response: %r", rx)
-        return self.parse_at_response(rx)
 
-    def write(self, register_addr, count, values):
-        request = self.build_request(register_addr, count, 0x10, values)
-        logging.debug("Write request: %r", request)
-        self.sock.sendto(request, (self.Logger_IP, self.Logger_Port))
-        rx = self.sock.recv(1024)
-        logging.debug("Write response: %r", rx)
-        return self.parse_at_response(rx)
+    def __init__(self ,IP , Port,timeout=1) :
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.settimeout(timeout)
+        self.Logger_IP=IP
+        self.Logger_Port=Port
+        self.ip=''
+        self.mac=''
+        self.serial=''
+        try:
+            (self.ip,self.mac,self.serial)=self.hello()
+        finally:
+            return
+
+    def __del__(self) :
+        try:
+            # print('Disconnect with AT+Q')
+            logging.debug('Disconnect with AT+Q')
+            self.bye()
+        finally:
+            return
